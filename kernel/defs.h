@@ -158,6 +158,7 @@ void            uartputc_sync(int);
 int             uartgetc(void);
 
 // vm.c
+extern pagetable_t kernel_pagetable;
 void            kvminit(void);
 void            kvminithart(void);
 uint64          kvmpa(uint64);
@@ -179,7 +180,13 @@ int             copyout(pagetable_t, uint64, char *, uint64);
 int             copyin(pagetable_t, char *, uint64, uint64);
 int             copyinstr(pagetable_t, char *, uint64, uint64);
 int             test_pagetable();
-
+void            vmprint(pagetable_t pagetable);
+pagetable_t     kvmcreate(void);
+void            kvmfree(pagetable_t);
+void            sync_pagetable(pagetable_t kpgtbl, pagetable_t upgtbl);
+int             copyin_new(pagetable_t, char *, uint64, uint64);
+int             copyinstr_new(pagetable_t, char *, uint64, uint64);
+pte_t*          walk(pagetable_t, uint64, int); 
 // plic.c
 void            plicinit(void);
 void            plicinithart(void);

@@ -29,14 +29,14 @@ void procinit(void) {
   for (p = proc; p < &proc[NPROC]; p++) {
     initlock(&p->lock, "proc");
 
-    // Allocate a page for the process's kernel stack.
-    // Map it high in memory, followed by an invalid
-    // guard page.
-    char *pa = kalloc();
-    if (pa == 0) panic("kalloc");
-    uint64 va = KSTACK((int)(p - proc));
-    kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-    p->kstack = va;
+    // // Allocate a page for the process's kernel stack.
+    // // Map it high in memory, followed by an invalid
+    // // guard page.
+    // char *pa = kalloc();
+    // if (pa == 0) panic("kalloc");
+    // uint64 va = KSTACK((int)(p - proc));
+    // kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+    // p->kstack = va;
   }
   kvminithart();
 }
@@ -103,6 +103,27 @@ found:
     return 0;
   }
 
+ if ((p->k_pagetable = kvmcreate()) == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  char *pa = kalloc();
+  if (pa == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  p->kstack_pa = (uint64)pa;
+  p->kstack = KSTACK((int)(p - proc)); // 内核栈虚拟地址
+
+  if (mappages(p->k_pagetable, p->kstack, PGSIZE, p->kstack_pa, PTE_R | PTE_W) != 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if (p->pagetable == 0) {
@@ -128,6 +149,20 @@ static void freeproc(struct proc *p) {
   p->trapframe = 0;
   if (p->pagetable) proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+
+  if (p->kstack_pa) kfree((void *)p->kstack_pa);
+  p->kstack_pa = 0;
+
+  if (p->k_pagetable) {
+    if (p->k_pagetable[0] & PTE_V) {
+      pagetable_t kl1 = (pagetable_t)PTE2PA(p->k_pagetable[0]);
+      for (int i = 0; i < 96; i++) {
+        kl1[i] = 0; 
+      }
+    }
+    kvmfree(p->k_pagetable); 
+    p->k_pagetable = 0;
+  }
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -191,6 +226,9 @@ void userinit(void) {
   // allocate one user page and copy init's instructions
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
+
+  sync_pagetable(p->k_pagetable, p->pagetable);
+
   p->sz = PGSIZE;
 
   // prepare for the very first "return" from kernel to user.
@@ -220,6 +258,9 @@ int growproc(int n) {
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
   p->sz = sz;
+
+  sync_pagetable(p->k_pagetable, p->pagetable);
+
   return 0;
 }
 
@@ -262,8 +303,10 @@ int fork(void) {
 
   np->state = RUNNABLE;
 
-  release(&np->lock);
+  sync_pagetable(np->k_pagetable, np->pagetable);
 
+  release(&np->lock);
+  
   return pid;
 }
 
@@ -430,7 +473,14 @@ void scheduler(void) {
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        w_satp(MAKE_SATP(p->k_pagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
+
+        w_satp(MAKE_SATP(kernel_pagetable));
+        sfence_vma();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.

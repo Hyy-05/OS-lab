@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -112,8 +114,11 @@ uint64 kvmpa(uint64 va) {
   uint64 off = va % PGSIZE;
   pte_t *pte;
   uint64 pa;
+  struct proc *p = myproc();
 
-  pte = walk(kernel_pagetable, va, 0);
+  if (p == 0) panic("kvmpa: no proc");
+
+  pte = walk(p->k_pagetable, va, 0);
   if (pte == 0) panic("kvmpa");
   if ((*pte & PTE_V) == 0) panic("kvmpa");
   pa = PTE2PA(*pte);
@@ -315,61 +320,83 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
 // Copy from user to kernel.
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
+// int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
+//   uint64 n, va0, pa0;
+
+//   while (len > 0) {
+//     va0 = PGROUNDDOWN(srcva);
+//     pa0 = walkaddr(pagetable, va0);
+//     if (pa0 == 0) return -1;
+//     n = PGSIZE - (srcva - va0);
+//     if (n > len) n = len;
+//     memmove(dst, (void *)(pa0 + (srcva - va0)), n);
+
+//     len -= n;
+//     dst += n;
+//     srcva = va0 + PGSIZE;
+//   }
+//   return 0;
+// }
+
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
-  uint64 n, va0, pa0;
-
-  while (len > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > len) n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  // 开启 SUM 位，允许内核访问用户态页面
+  uint64 sstatus = r_sstatus();
+  w_sstatus(sstatus | SSTATUS_SUM);
+  
+  int ret = copyin_new(pagetable, dst, srcva, len);
+  
+  // 关闭 SUM 位，恢复状态
+  w_sstatus(sstatus);
+  return ret;
 }
 
 // Copy a null-terminated string from user to kernel.
 // Copy bytes to dst from virtual address srcva in a given page table,
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
+// int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
+//   uint64 n, va0, pa0;
+//   int got_null = 0;
+
+//   while (got_null == 0 && max > 0) {
+//     va0 = PGROUNDDOWN(srcva);
+//     pa0 = walkaddr(pagetable, va0);
+//     if (pa0 == 0) return -1;
+//     n = PGSIZE - (srcva - va0);
+//     if (n > max) n = max;
+
+//     char *p = (char *)(pa0 + (srcva - va0));
+//     while (n > 0) {
+//       if (*p == '\0') {
+//         *dst = '\0';
+//         got_null = 1;
+//         break;
+//       } else {
+//         *dst = *p;
+//       }
+//       --n;
+//       --max;
+//       p++;
+//       dst++;
+//     }
+
+//     srcva = va0 + PGSIZE;
+//   }
+//   if (got_null) {
+//     return 0;
+//   } else {
+//     return -1;
+//   }
+// }
+
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
-  uint64 n, va0, pa0;
-  int got_null = 0;
-
-  while (got_null == 0 && max > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > max) n = max;
-
-    char *p = (char *)(pa0 + (srcva - va0));
-    while (n > 0) {
-      if (*p == '\0') {
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if (got_null) {
-    return 0;
-  } else {
-    return -1;
-  }
+  uint64 sstatus = r_sstatus();
+  w_sstatus(sstatus | SSTATUS_SUM);
+  
+  int ret = copyinstr_new(pagetable, dst, srcva, max);
+  
+  w_sstatus(sstatus);
+  return ret;
 }
 
 // check if use global kpgtbl or not
@@ -378,4 +405,93 @@ int test_pagetable() {
   uint64 gsatp = MAKE_SATP(kernel_pagetable);
   printf("test_pagetable: %d\n", satp != gsatp);
   return satp != gsatp;
+}
+
+static void vmprint_helper(pagetable_t pagetable, int level, uint64 va_base) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if (pte & PTE_V) {
+      uint64 pa = PTE2PA(pte);
+      uint64 va = va_base | ((uint64)i << (12 + 9 * (3 - level))); 
+      for (int j = 0; j < level; j++) printf("|| ");
+      
+      if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+        printf("idx: %d: pa: %p, flags: ----\n", i, pa);
+        vmprint_helper((pagetable_t)pa, level + 1, va);
+      } else {
+        char flags[5] = "----";
+        if (pte & PTE_R) flags[0] = 'r';
+        if (pte & PTE_W) flags[1] = 'w';
+        if (pte & PTE_X) flags[2] = 'x';
+        if (pte & PTE_U) flags[3] = 'u';
+        
+        printf("idx: %d: va: %p -> pa: %p, flags: %s\n", i, va, pa, flags);
+      }
+    }
+  }
+}
+
+
+void vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", (uint64)pagetable);
+  vmprint_helper(pagetable, 1, 0); 
+}
+
+pagetable_t kvmcreate() {
+  pagetable_t kpgtbl = (pagetable_t)kalloc();
+  if (kpgtbl == 0) return 0;
+  memset(kpgtbl, 0, PGSIZE);
+
+
+  if (mappages(kpgtbl, UART0, PGSIZE, UART0, PTE_R | PTE_W) != 0) goto bad;
+  if (mappages(kpgtbl, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) != 0) goto bad;
+  //if (mappages(kpgtbl, CLINT, 0x10000, CLINT, PTE_R | PTE_W) != 0) goto bad;
+  if (mappages(kpgtbl, PLIC, 0x400000, PLIC, PTE_R | PTE_W) != 0) goto bad;
+  if (mappages(kpgtbl, KERNBASE, (uint64)etext - KERNBASE, KERNBASE, PTE_R | PTE_X) != 0) goto bad;
+  if (mappages(kpgtbl, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext, PTE_R | PTE_W) != 0) goto bad;
+  if (mappages(kpgtbl, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) != 0) goto bad;
+
+  return kpgtbl;
+
+bad:
+  panic("kvmcreate: mappages failed");
+}
+
+static void kvmfreewalk(pagetable_t pagetable) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      uint64 child = PTE2PA(pte);
+      kvmfreewalk((pagetable_t)child);
+      pagetable[i] = 0;
+    } else if (pte & PTE_V) {
+      pagetable[i] = 0;
+    }
+  }
+  kfree((void *)pagetable); 
+}
+
+void kvmfree(pagetable_t pagetable) {
+  kvmfreewalk(pagetable);
+}
+
+void sync_pagetable(pagetable_t kpgtbl, pagetable_t upgtbl) {
+  pte_t *upte = &upgtbl[0];
+  
+  if (!(*upte & PTE_V)) return;
+  
+  pagetable_t up_l1 = (pagetable_t)PTE2PA(*upte);
+
+  pte_t *kpte = &kpgtbl[0];
+  if (!(*kpte & PTE_V)) {
+    pagetable_t new_l1 = (pagetable_t)kalloc();
+    memset(new_l1, 0, PGSIZE);
+    *kpte = PA2PTE(new_l1) | PTE_V;
+  }
+  
+  pagetable_t k_l1 = (pagetable_t)PTE2PA(*kpte);
+
+  for (int i = 0; i < 96; i++) {
+    k_l1[i] = up_l1[i];
+  }
 }
